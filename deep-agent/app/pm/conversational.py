@@ -87,6 +87,320 @@ async def _llm_chat_json(messages: list[dict], llm_cfg: dict) -> Optional[dict]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# OpenAI Tools 定义（供 LLM 调用任务管理工具）
+# ---------------------------------------------------------------------------
+
+TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "列出所有父任务（最近50条），包含每个任务的状态和工作项数量。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task",
+            "description": "获取指定任务的详细信息，包含所有工作项和进度。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_task",
+            "description": "创建新任务并自动拆解工作项。需要用户提供任务标题和描述。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "任务标题"},
+                    "description": {"type": "string", "description": "任务详细描述"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_task",
+            "description": "启动一个已创建但未开工的任务，使其进入执行队列。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pause_task",
+            "description": "暂停一个正在执行中的任务（任务状态变为 blocked）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_task",
+            "description": "重新启动一个被暂停的任务。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_task",
+            "description": "停止一个任务（状态变为 failed），不可恢复。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_task",
+            "description": "删除一个任务（软删除）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task_logs",
+            "description": "获取任务的执行日志（最近50条）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "父任务 ID"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_experts",
+            "description": "列出系统中所有可用的专家 Agent 类型。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+]
+
+
+# 工具名 → 函数映射
+_TOOL_HANDLERS: dict[str, callable] = {}
+
+
+def _register_tool(name: str, func: callable) -> None:
+    _TOOL_HANDLERS[name] = func
+
+
+def _resolve_tool_args(tool_call: dict) -> dict:
+    """从 LLM tool_call 中提取函数参数。"""
+    try:
+        args_str = tool_call["function"]["arguments"]
+        if isinstance(args_str, str):
+            return json.loads(args_str)
+        return args_str
+    except Exception:
+        return {}
+
+
+async def _execute_tool_call(tool_call: dict) -> dict:
+    """执行单个 tool_call，返回结果字符串。"""
+    func_name = tool_call["function"]["name"]
+    handler = _TOOL_HANDLERS.get(func_name)
+    if not handler:
+        return json.dumps({"ok": False, "error": f"未知工具: {func_name}"})
+    args = _resolve_tool_args(tool_call)
+    try:
+        result = handler(**args)
+        # 如果是 coroutine，要 await
+        import asyncio
+        if asyncio.iscoroutine(result):
+            result = await result
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return str(result)
+    except TypeError:
+        # 参数不匹配，尝试无参数调用
+        try:
+            result = handler()
+            if asyncio.iscoroutine(result):
+                result = await result
+            if isinstance(result, dict):
+                return json.dumps(result)
+            return str(result)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+
+async def _llm_chat_with_tools(
+    messages: list[dict],
+    llm_cfg: dict,
+    parent_id: str,
+) -> tuple[str, list[dict]]:
+    """带工具调用的 LLM 对话循环。
+
+    Returns:
+        (final_text, all_messages): 最终回复文本，以及包含 tool_calls 的完整消息历史
+    """
+    import httpx
+
+    base_url = (llm_cfg.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return "LLM 未配置", messages
+    api_key = llm_cfg.get("api_key") or "ollama"
+    model = llm_cfg.get("model") or "qwen2.5:7b"
+    temperature = float(llm_cfg.get("temperature") or 0.2)
+    if not base_url.endswith("/v1"):
+        base_url = base_url + "/v1"
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    max_iterations = 10  # 防止死循环
+    for iteration in range(max_iterations):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "tools": TOOLS,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                if r.status_code != 200:
+                    logger.warning("LLM tool-call 失败 status={} body={}", r.status_code, r.text[:200])
+                    return f"LLM 调用失败（{r.status_code}）", messages
+                data = r.json()
+                msg = data["choices"][0]["message"]
+                messages.append(msg)
+
+                # 检查是否需要调用工具
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    # 最终回复
+                    return (msg.get("content") or "").strip(), messages
+
+                # 执行所有 tool_calls（串行）
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    logger.info("LLM 调用工具: {} (parent_id={})", func_name, parent_id)
+                    tool_result = await _execute_tool_call(tc)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": func_name,
+                        "content": tool_result,
+                    })
+        except Exception as e:
+            logger.warning("LLM tool-call 异常: {}", e)
+            return f"LLM 调用异常: {e}", messages
+
+    return "工具调用超出最大次数限制（可能存在循环）", messages
+
+
+async def _llm_streaming_chat(
+    messages: list[dict],
+    llm_cfg: dict,
+):
+    """流式调用 LLM，yield 每个 token。"""
+    import httpx
+
+    base_url = (llm_cfg.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return
+    api_key = llm_cfg.get("api_key") or "ollama"
+    model = llm_cfg.get("model") or "qwen2.5:7b"
+    if not base_url.endswith("/v1"):
+        base_url = base_url + "/v1"
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(llm_cfg.get("temperature") or 0.2),
+        "stream": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as r:
+                if r.status_code != 200:
+                    return
+                async for line in r.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        delta = json.loads(data_str)
+                    except Exception:
+                        continue
+                    delta_content = delta.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+                    if delta_content:
+                        yield delta_content
+    except Exception as e:
+        logger.warning("LLM 流式调用异常: {}", e)
+        return
+
+
 def _safe_parse_json(text: str) -> Optional[dict]:
     text = text.strip()
     text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
@@ -460,6 +774,21 @@ async def _tool_list_experts() -> dict:
     return {"ok": True, "data": expert_pool.types()}
 
 
+
+
+# ---------------------------------------------------------------------------
+# 注册所有工具（在所有 _tool_* 函数定义之后）
+# ---------------------------------------------------------------------------
+_register_tool("list_tasks", _tool_list_tasks)
+_register_tool("get_task", _tool_get_task)
+_register_tool("create_task", _tool_create_task)
+_register_tool("start_task", _tool_start_task)
+_register_tool("pause_task", _tool_pause_task)
+_register_tool("resume_task", _tool_resume_task)
+_register_tool("stop_task", _tool_stop_task)
+_register_tool("delete_task", _tool_delete_task)
+_register_tool("get_task_logs", _tool_get_logs)
+_register_tool("list_experts", _tool_list_experts)
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -521,55 +850,26 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
     messages = [{"role": "system", "content": system}] + history[:-1]  # 历史不带最后那条
     messages.append(history[-1])
 
-    # 5) 调 LLM
+    # 5) 调 LLM（带工具调用）
     llm_cfg = await runtime_settings.get_llm_config()
-    parsed: Optional[dict] = None
+    final_text = "（LLM 不可用）"
     if llm_cfg.get("provider") and llm_cfg.get("model"):
-        parsed = await _llm_chat_json(messages, llm_cfg)
-
-    if not parsed:
-        return await _fallback_no_llm(raw, parent_id)
+        final_text, messages = await _llm_chat_with_tools(messages, llm_cfg, parent_id or "")
+    else:
+        final_text = await _fallback_no_llm(raw, parent_id)
+        if isinstance(final_text, ChatReply):
+            final_text = final_text.text
 
     # 6) 保存用户消息
     await _save_chat(parent_id, "boss", raw, data={"optimized": optimized})
-
-    action = parsed.get("action", "chat")
-    text = (parsed.get("text") or "").strip()
-    params = parsed.get("params") or {}
-
-    if action == "chat":
-        await _save_chat(parent_id, "project_manager", text)
-        await event_bus.publish(Events.CHAT_MESSAGE, {
-            "parent_id": parent_id,
-            "role": "project_manager",
-            "content": text,
-            "intent": "chat",
-        })
-        return ChatReply(text=text, parent_id=parent_id, intent="chat")
-
-    if action == "ask_to_create":
-        await _save_chat(
-            parent_id,
-            "project_manager",
-            text,
-            data={"pending_task": params, "action": "ask_to_create"},
-        )
-        await event_bus.publish(Events.CHAT_MESSAGE, {
-            "parent_id": parent_id,
-            "role": "project_manager",
-            "content": text,
-            "intent": "ask_to_create",
-            "params": params,
-        })
-        return ChatReply(
-            text=text,
-            parent_id=parent_id,
-            intent="ask_to_create",
-            plan=params,  # 前端用来显示"建议参数"
-        )
-
-    # 兜底
-    await _save_chat(parent_id, "project_manager", text or "（LLM 未返回 action，按 chat 处理）")
+    await _save_chat(parent_id, "project_manager", final_text)
+    await event_bus.publish(Events.CHAT_MESSAGE, {
+        "parent_id": parent_id,
+        "role": "project_manager",
+        "content": final_text,
+        "intent": "chat",
+    })
+    return ChatReply(text=final_text, parent_id=parent_id, intent="chat")
     return ChatReply(text=text or "（无回复）", parent_id=parent_id, intent="chat")
 
 

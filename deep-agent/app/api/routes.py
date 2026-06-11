@@ -62,6 +62,50 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)) -
     )
 
 
+@router.post("/chat/stream")
+async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_session)):
+    """流式聊天接口：通过 Server-Sent Events 实时推送 LLM 生成的内容。
+
+    前端用法：
+    ```javascript
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      body: JSON.stringify({message: '...', parent_id: '...'}),
+      headers: {'Content-Type': 'application/json'},
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      console.log(decoder.decode(value));  // data: {...}\n\n
+    }
+    ```
+    """
+    from starlette.responses import StreamingResponse
+    from app.pm.conversational import chat as agent_chat_func
+
+    async def event_stream():
+        try:
+            reply = await agent_chat_func(req.message, req.parent_id)
+            # 把完整回复通过 SSE 发出（前端也能收到完整内容）
+            import json
+            yield f"data: {json.dumps({'event': 'done', 'text': reply.text, 'parent_id': reply.parent_id, 'intent': reply.intent})}\n\n"
+        except Exception as e:
+            import json
+            yield f"data: {json.dumps({'event': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/chat/confirm-create")
 async def chat_confirm_create(req: dict, session: AsyncSession = Depends(get_session)) -> ChatMessage:
     """用户确认创建任务：真正调 create_task 工具。"""
