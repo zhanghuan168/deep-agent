@@ -12,6 +12,7 @@ import asyncio
 import json
 import textwrap
 import re
+import os
 from typing import Any, Optional
 
 from app.agents.base import BaseExpertAgent, StageContext, StageResult
@@ -123,6 +124,230 @@ def _collect_history_artifact(ctx: StageContext, key: str) -> Any:
         if key in artifacts:
             return artifacts[key]
     return None
+
+
+# ---------------------------------------------------------------------------
+# CodeRunner：代码执行器 + Self-Healing
+# ---------------------------------------------------------------------------
+
+import asyncio
+import tempfile
+import os
+import pathlib
+import time
+
+
+class CodeRunResult:
+    """单次代码执行结果。"""
+
+    def __init__(
+        self,
+        success: bool,
+        stdout: str = "",
+        stderr: str = "",
+        execution_time: float = 0.0,
+        files_written: list[str] | None = None,
+        error: str = "",
+    ) -> None:
+        self.success = success
+        self.stdout = stdout
+        self.stderr = stderr
+        self.execution_time = execution_time
+        self.files_written = files_written or []
+        self.error = error
+
+
+
+class CodeRunner:
+    """代码执行器：写入临时文件 + 进程执行 + 超时控制。
+
+    支持 self-healing：执行失败时，自动让 LLM 分析错误并生成修复代码。
+    """
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        timeout_seconds: float = 30.0,
+        max_output_chars: int = 2000,
+    ) -> None:
+        self.max_retries = max_retries
+        self.timeout_seconds = timeout_seconds
+        self.max_output_chars = max_output_chars
+
+    async def run_source_files(
+        self,
+        source_files: list[dict[str, str]],
+        run_cmd: str | None = None,
+    ) -> CodeRunResult:
+        """执行 source_files，返回执行结果。
+
+
+        Args:
+            source_files: [{"path": "src/xxx.py", "content": "..."}, ...]
+            run_cmd: 启动命令，如 None 则找首个 Python 文件直接 python 执行
+        """
+        if not source_files:
+            return CodeRunResult(success=False, error="No source files provided")
+
+
+        work_dir = tempfile.mkdtemp(prefix="deepagent_code_")
+        try:
+            # 1. 写入所有文件
+            written = []
+            for f in source_files:
+                fpath = os.path.join(work_dir, f["path"])
+                pathlib.Path(fpath).parent.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(fpath).write_text(f["content"], encoding="utf-8")
+                written.append(fpath)
+
+            # 2. 确定执行命令
+            if run_cmd:
+                cmd = run_cmd.strip().split()
+            else:
+                # 找入口文件（优先 main.py 或第一个 .py）
+                entry = next((p for p in written if p.endswith("main.py")), None)
+                if entry is None and written:
+                    entry = written[0]
+                cmd = ["python3", entry]
+
+
+            # 3. 执行（限时）
+            start = time.monotonic()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=work_dir,
+                limit=1024 * 1024,  # 1MB stdout/stderr buffer
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=self.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                execution_time = time.monotonic() - start
+                return CodeRunResult(
+                    success=False,
+                    stdout="",
+                    stderr=f"Execution timed out after {self.timeout_seconds}s",
+                    execution_time=execution_time,
+                    files_written=written,
+                    error=f"Timeout after {self.timeout_seconds}s",
+                )
+            execution_time = time.monotonic() - start
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            success = proc.returncode == 0
+
+            # 4. 截断输出
+            stdout = stdout[: self.max_output_chars]
+            stderr = stderr[: self.max_output_chars]
+
+            return CodeRunResult(
+                success=success,
+                stdout=stdout,
+                stderr=stderr,
+                execution_time=execution_time,
+                files_written=written,
+                error="" if success else f"Exit code {proc.returncode}",
+            )
+        finally:
+            # 清理临时目录
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    async def run_with_self_healing(
+        self,
+        source_files: list[dict[str, str]],
+        task_title: str,
+        run_cmd: str | None = None,
+    ) -> CodeRunResult:
+        """执行代码，失败时让 LLM 自愈后重试（最多 max_retries 次）。"""
+        current_files = list(source_files)
+        last_result: CodeRunResult | None = None
+
+        for attempt in range(self.max_retries + 1):
+            result = await self.run_source_files(current_files, run_cmd)
+            last_result = result
+
+            if result.success:
+                logger.info(
+                    "CodeRunner exec success on attempt {}/{}: {}",
+                    attempt + 1, self.max_retries + 1, task_title,
+                )
+                return result
+
+            if attempt < self.max_retries:
+                logger.info(
+                    "CodeRunner exec failed (attempt {}/{}), triggering self-healing",
+                    attempt + 1, self.max_retries,
+                )
+                current_files = await self._llm_fix_code(
+                    current_files, result, task_title,
+                )
+                if current_files is None:
+                    break  # LLM 无法修复
+
+
+        return last_result or CodeRunResult(success=False, error="Max retries exceeded")
+
+
+    async def _llm_fix_code(
+        self,
+        broken_files: list[dict[str, str]],
+        error_result: CodeRunResult,
+        task_title: str,
+    ) -> list[dict[str, str]] | None:
+        """让 LLM 分析错误并生成修复后的代码。"""
+        fix_system = textwrap.dedent(""""你是一名资深 Python 开发者，擅长修复代码错误。
+
+收到错误信息后，准确分析问题根因并生成修复后的代码。
+严格输出 JSON：
+{
+  "source_files": [{"path": "...", "content": "..."}],
+  "analysis": "错误分析（1-2句话）"
+}
+原则：
+- 只修复错误，不要改变正常行为
+- 保持代码风格一致""")
+
+        files_summary = json.dumps(broken_files, ensure_ascii=False, indent=2)
+        user_prompt = textwrap.dedent(
+            f"""任务：{task_title}
+
+上次执行失败，错误信息：
+stdout:\n{error_result.stdout}\n\nstderr:\n{error_result.stderr}\n\n原始代码：
+{files_summary[:3000]}
+
+
+请分析错误并输出修复后的代码（JSON格式）。"""
+        )
+
+        content = await _call_llm(fix_system, user_prompt, json_mode=True)
+        if not content:
+            return None
+
+        parsed = _safe_parse_json(content)
+        if not parsed or "source_files" not in parsed:
+            logger.warning("CodeRunner: LLM fix response invalid")
+            return None
+
+        logger.info("CodeRunner: LLM self-healing generated {} files", len(parsed["source_files"]))
+        return parsed["source_files"]
+
+
+
+_code_runner: CodeRunner | None = None
+
+
+
+def get_code_runner() -> CodeRunner:
+    global _code_runner
+    if _code_runner is None:
+        _code_runner = CodeRunner(max_retries=3, timeout_seconds=30.0)
+    return _code_runner
 
 
 # ---------------------------------------------------------------------------
@@ -657,12 +882,43 @@ source_files：实现文件（后写！），Python 3.10+，类型注解，docst
                 files = parsed.get("source_files", [])
                 test_files = parsed.get("test_files", [])
                 logger.info("TDD 实现 LLM 生成成功: {} ({} source, {} test)", title, len(files), len(test_files))
+
+                # -------------------------------------------------------
+                # 【新增】代码执行阶段：self-healing 执行循环
+                # -------------------------------------------------------
+                execution_result = None
+                if files:
+                    runner = get_code_runner()
+                    exec_res = await runner.run_with_self_healing(
+                        source_files=files,
+                        task_title=title,
+                    )
+                    execution_result = {
+                        "success": exec_res.success,
+                        "stdout": exec_res.stdout,
+                        "stderr": exec_res.stderr,
+                        "execution_time": round(exec_res.execution_time, 3),
+                        "files_written": [os.path.basename(p) for p in exec_res.files_written],
+                        "error": exec_res.error,
+                    }
+                    if exec_res.success:
+                        logger.info(
+                            "CodeRunner: 《{}》执行成功，耗时 {:.1f}s",
+                            title, exec_res.execution_time,
+                        )
+                    else:
+                        logger.warning(
+                            "CodeRunner: 《{}》执行失败: {} / stdout={} / stderr={}",
+                            title, exec_res.error, exec_res.stdout[:200], exec_res.stderr[:200],
+                        )
+
                 return StageResult(
-                    summary=f"完成《{title}》TDD 实现",
+                    summary=f"完成《{title}》TDD 实现" + ("（代码执行成功）" if (execution_result and execution_result["success"]) else "（代码执行失败）" if execution_result else ""),
                     artifacts={
                         "source_files": files,
                         "test_files": test_files,
                         "summary": parsed.get("summary", ""),
+                        "execution": execution_result,
                     },
                 )
 
