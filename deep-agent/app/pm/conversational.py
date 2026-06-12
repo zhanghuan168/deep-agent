@@ -1,19 +1,17 @@
-"""LLM 驱动的项目管理 Agent — 修正版。
+"""LLM 驱动的项目管理 Agent。
 
 设计原则：
-1. Agent 接收消息后，**先把描述优化**（让用户的话更有逻辑性）。
-2. 优化后的描述 + 历史 + 工具列表一起发给 LLM。
+1. 直接用用户原话，不做二次优化。
+2. 历史消息完整传入 LLM，支持多轮上下文。
 3. LLM 决策：
-   - `action=chat`：直接回复（聊天/咨询）
-   - `action=ask_to_create`：建议创建任务，但**先问用户**——不直接调工具
+   - `action=chat`：直接回复（查询/闲聊/能力介绍）
+   - `action=ask_to_create`：仅当用户描述了需要新建的任务时才询问确认
 4. 用户点"确认"后，Agent 才真正调 create_task 工具。
-5. 工具执行完，再让 LLM 决定最终回复。
 
 LLM 输出的 JSON：
 {
   "action": "chat" | "ask_to_create",
   "text": "回复给用户的内容（直接显示）",
-  "optimized_intent": "优化后的用户需求（内部用）",
   "params": { "title": ..., "description": ... }  // 仅 ask_to_create
 }
 """
@@ -491,34 +489,31 @@ async def _optimize_message(raw: str) -> str:
 
 SYSTEM_PROMPT = """你是一个 AI 项目管理助手。
 
-【职责】
-1. **理解用户意图**（你看到的消息已经被 Agent 优化过，比原文更结构化）
-2. **决定是否需要创建任务**：
-   - 闲聊/咨询/能力介绍 → 直接回复（action=chat）
-   - 描述了一个具体要做的事情 → 询问用户是否要创建任务（action=ask_to_create）
-3. 你的回复会**直接显示给用户**。
+
+【判断规则 — 重要】
+1. 用户想**查询/搜索/列表**任务 → 直接调 list_tasks / get_task 工具，回复 action=chat
+2. 用户想**了解你能做什么** → 直接回复，action=chat
+3. 用户**闲聊/问候** → 直接回复，action=chat
+4. 用户描述了一件**以前不存在、需要新建的事情** → action=ask_to_create
+5. 任何时候都可以调用工具，不一定要创建任务
 
 【输出格式（必须 JSON）】
 {
   "action": "chat" | "ask_to_create",
-  "text": "你的回复内容（直接显示给用户，简洁自然，1-3 句话）",
-  "optimized_intent": "对用户需求的更准确理解（可选）",
+  "text": "你的回复内容（直接显示给用户）",
   "params": { "title": "...", "description": "..." }  // 仅 ask_to_create
 }
 
-【action=chat】直接回复
+【action=chat】直接回复（查询结果、闲聊回复、能力介绍等）
 {
   "action": "chat",
-  "text": "我是 AI 助手，能帮你..."
+  "text": "当前共有 3 个任务：1. xxx（进行中）2. xxx（已暂停）..."
 }
 
-【action=ask_to_create】询问用户是否要创建任务
-- 你需要先**询问**用户是否要创建（text 里体现"是否/可以/要不要"）
-- 给出你的"建议拆解"（不必给出完整 work_items，Agent 会自动拆）
-- params 里给出**建议的 title 和 description**
+【action=ask_to_create】询问用户是否要创建任务（仅针对全新任务）
 {
   "action": "ask_to_create",
-  "text": "我帮您创建这个任务：《会记账的微信小程序》。开始拆解吗？",
+  "text": "好的，我帮您创建这个任务：《会记账的微信小程序》。确认创建吗？",
   "params": {
     "title": "会记账的微信小程序",
     "description": "用户需要构建一个支持日常开支记录和按月统计的微信小程序，含登录、记账、统计、报表四大功能"
@@ -823,32 +818,26 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
     """主入口：所有聊天内容由 LLM 决定。
 
     流程：
-    1. Agent 优化消息（让用户的话更逻辑性）
-    2. 优化后的消息 + 历史 → LLM
-    3. LLM 决定 action=chat 或 action=ask_to_create
-    4. 若是 ask_to_create，不立即调工具，等用户确认
+    1. 用户消息 + 历史 → LLM
+    2. LLM 决定 action=chat 或 action=ask_to_create
+    3. 若是 ask_to_create，等用户确认后才调工具
     """
     raw = (message or "").strip()
     if not raw:
         return ChatReply(text="需要我帮您做什么？", intent="chat")
 
-    # 1) 优化消息
-    optimized = await _optimize_message(raw)
-    logger.info("原始: {!r} → 优化: {!r}", raw[:50], optimized[:50])
-
-    # 2) 没有 parent_id 就建一个
+    # 1) 没有 parent_id 就建一个
     if not parent_id:
         parent_id = await _create_chat_parent(raw)
 
-    # 3) 拉历史
+    # 2) 拉历史
     history = await _get_history(parent_id)
 
-    # 4) 构造 messages（带优化后的描述）
-    # history[-1] 就是刚 append 进去的用户消息，不要重复加
+    # 3) 构造 messages（直接用用户原话，不优化）
     system = SYSTEM_PROMPT
-    messages = [{"role": "system", "content": system}] + history
+    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": raw}]
 
-    # 5) 调 LLM（带工具调用）
+    # 4) 调 LLM（带工具调用）
     llm_cfg = await runtime_settings.get_llm_config()
     final_text = "（LLM 不可用）"
     if llm_cfg.get("provider") and llm_cfg.get("model"):
@@ -860,8 +849,8 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
         else:
             final_text = fallback_reply
 
-    # 6) 保存用户消息
-    await _save_chat(parent_id, "boss", raw, data={"optimized": optimized})
+    # 5) 保存用户消息
+    await _save_chat(parent_id, "boss", raw)
     await _save_chat(parent_id, "project_manager", final_text)
     await event_bus.publish(Events.CHAT_MESSAGE, {
         "parent_id": parent_id,
