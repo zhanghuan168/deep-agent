@@ -19,6 +19,8 @@ from app.agents.base import BaseExpertAgent, StageContext, StageResult
 from app.db.models import StageName, ReviewType
 from app.logging import logger
 
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(4)
+
 
 # ---------------------------------------------------------------------------
 # LLM 调用

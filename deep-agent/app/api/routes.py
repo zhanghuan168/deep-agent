@@ -35,6 +35,7 @@ from app.pm import (
     confirm_create_task,
     confirm_start_task,
 )
+from app.pm import conversational as conv
 
 
 router = APIRouter()
@@ -200,6 +201,50 @@ async def patch_parent_status(
         {"parent_id": parent_id, "status": new_enum.value},
     )
     return {"ok": True, "status": new_enum.value}
+
+
+@router.delete("/parents/{parent_id}")
+async def delete_parent(parent_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    """删除父任务（软删除）。"""
+    parent = await repo.get_parent_task(session, parent_id)
+    if parent is None:
+        raise HTTPException(404, "父任务不存在")
+    result = await conv._tool_delete_task(parent_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "删除失败"))
+    return result
+
+
+@router.post("/parents/{parent_id}/action")
+async def parent_action(
+    parent_id: str,
+    payload: dict,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """执行父任务的控制操作：start / stop / pause / resume。"""
+    action = payload.get("action")
+    if not action:
+        raise HTTPException(400, "缺少 action 字段")
+
+    # 先查 parent 是否存在
+    parent = await repo.get_parent_task(session, parent_id)
+    if parent is None:
+        raise HTTPException(404, "父任务不存在")
+
+    if action == "start":
+        result = await conv._tool_start_task(parent_id)
+    elif action == "stop":
+        result = await conv._tool_stop_task(parent_id)
+    elif action == "pause":
+        result = await conv._tool_pause_task(parent_id)
+    elif action == "resume":
+        result = await conv._tool_resume_task(parent_id)
+    else:
+        raise HTTPException(400, f"未知操作: {action}")
+
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "操作失败"))
+    return result
 
 
 @router.get("/workflows/{workflow_id}", response_model=WorkflowTaskRead)

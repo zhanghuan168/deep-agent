@@ -16,6 +16,9 @@ from typing import Any
 
 from app.logging import logger
 from app import runtime_settings
+import asyncio
+
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(4)
 
 
 # ---------------------------------------------------------------------------

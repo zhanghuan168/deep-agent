@@ -8,6 +8,15 @@
       </el-descriptions-item>
       <el-descriptions-item label="工作项数">{{ parent.workflow_tasks?.length || 0 }}</el-descriptions-item>
       <el-descriptions-item label="创建时间">{{ formatTime(parent.created_at) }}</el-descriptions-item>
+      <el-descriptions-item label="操作" :span="3">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <el-button v-if="parent.status === 'draft' || parent.status === 'confirmed'" size="small" type="primary" @click="doAction('start')" :loading="actionLoading">启动</el-button>
+          <el-button v-if="parent.status === 'in_progress'" size="small" type="warning" @click="doAction('pause')" :loading="actionLoading">暂停</el-button>
+          <el-button v-if="parent.status === 'blocked'" size="small" type="success" @click="doAction('resume')" :loading="actionLoading">继续</el-button>
+          <el-button v-if="parent.status === 'in_progress' || parent.status === 'blocked' || parent.status === 'confirmed'" size="small" type="danger" @click="doAction('stop')" :loading="actionLoading">停止</el-button>
+          <el-button v-if="parent.status === 'failed' || parent.status === 'completed'" size="small" type="info" @click="deleteTask" :loading="actionLoading">删除</el-button>
+        </div>
+      </el-descriptions-item>
       <el-descriptions-item label="描述" :span="3">
         <pre class="desc-pre">{{ parent.description || '(无)' }}</pre>
       </el-descriptions-item>
@@ -66,6 +75,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '@/api'
+import { ElMessage } from 'element-plus'
 import { DocumentPanel } from '@/components'
 
 const route = useRoute()
@@ -73,6 +83,7 @@ const parent = ref(null)
 const logs = ref([])
 const ganttHost = ref(null)
 const logList = ref(null)
+const actionLoading = ref(false)
 let ganttInstance = null
 
 async function refresh() {
@@ -146,6 +157,40 @@ const stageTag = s => ({ pending: 'info', running: 'primary', succeeded: 'succes
 function formatTime(s) {
   if (!s) return ''
   try { return new Date(s).toLocaleString('zh-CN', { hour12: false }) } catch { return s }
+}
+
+async function doAction(action) {
+  if (!parent.value) return
+  actionLoading.value = true
+  try {
+    await api(`/parents/${parent.value.id}/action`, {
+      method: 'POST',
+      body: { action },
+    })
+    ElMessage.success(action === 'start' ? '已启动' : action === 'stop' ? '已停止' : action === 'pause' ? '已暂停' : action === 'resume' ? '已继续' : '操作成功')
+    await refresh()
+    window.dispatchEvent(new CustomEvent('parents-changed'))
+  } catch (e) {
+    ElMessage.error('操作失败：' + e.message)
+  } finally {
+    actionLoading.value = false
+  }
+}
+
+async function deleteTask() {
+  if (!parent.value) return
+  if (!confirm('确定删除该任务？')) return
+  actionLoading.value = true
+  try {
+    await api(`/parents/${parent.value.id}`, { method: 'DELETE' })
+    ElMessage.success('已删除')
+    window.dispatchEvent(new CustomEvent('parents-changed'))
+    history.back()
+  } catch (e) {
+    ElMessage.error('删除失败：' + e.message)
+  } finally {
+    actionLoading.value = false
+  }
 }
 
 function onWsEvent(e) {
