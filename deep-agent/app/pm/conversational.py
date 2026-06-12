@@ -844,11 +844,9 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
     history = await _get_history(parent_id)
 
     # 4) 构造 messages（带优化后的描述）
-    history.append({"role": "user", "content": f"[用户原始消息] {raw}\n[优化后意图] {optimized}"})
-
+    # history[-1] 就是刚 append 进去的用户消息，不要重复加
     system = SYSTEM_PROMPT
-    messages = [{"role": "system", "content": system}] + history[:-1]  # 历史不带最后那条
-    messages.append(history[-1])
+    messages = [{"role": "system", "content": system}] + history
 
     # 5) 调 LLM（带工具调用）
     llm_cfg = await runtime_settings.get_llm_config()
@@ -856,9 +854,11 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
     if llm_cfg.get("provider") and llm_cfg.get("model"):
         final_text, messages = await _llm_chat_with_tools(messages, llm_cfg, parent_id or "")
     else:
-        final_text = await _fallback_no_llm(raw, parent_id)
-        if isinstance(final_text, ChatReply):
-            final_text = final_text.text
+        fallback_reply = await _fallback_no_llm(raw, parent_id)
+        if isinstance(fallback_reply, ChatReply):
+            final_text = fallback_reply.text
+        else:
+            final_text = fallback_reply
 
     # 6) 保存用户消息
     await _save_chat(parent_id, "boss", raw, data={"optimized": optimized})
@@ -870,7 +870,6 @@ async def chat(message: str, parent_id: Optional[str] = None) -> ChatReply:
         "intent": "chat",
     })
     return ChatReply(text=final_text, parent_id=parent_id, intent="chat")
-    return ChatReply(text=text or "（无回复）", parent_id=parent_id, intent="chat")
 
 
 # ---------------------------------------------------------------------------

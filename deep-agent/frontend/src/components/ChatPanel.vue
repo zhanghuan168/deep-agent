@@ -32,8 +32,18 @@
               <div :class="['chat-msg-bubble', m.role === 'boss' ? 'boss' : 'pm']">
                 {{ m.content }}
               </div>
+              <!-- 内联确认按钮：出现在 ask_to_create / ask_to_start 消息旁 -->
+              <div v-if="m.role !== 'boss' && m.intent === 'ask_to_create'" style="margin-top:6px;display:flex;gap:6px">
+                <el-button size="small" type="primary" @click="$emit('confirm-create')">
+                  ✓ 确认创建
+                </el-button>
+              </div>
+              <div v-if="m.role !== 'boss' && m.intent === 'ask_to_start'" style="margin-top:6px;display:flex;gap:6px">
+                <el-button size="small" type="success" @click="$emit('confirm-start')">
+                  🚀 确认开工
+                </el-button>
+              </div>
             </div>
-          </div>
         </template>
       </div>
 
@@ -46,15 +56,9 @@
           @keydown.enter.exact.prevent="onSend"
           :disabled="loading"
         />
-        <div style="display:flex;justify-content:space-between;align-items:center">
+        <div style="display:flex;justify-content:flex-end;align-items:center">
           <el-button text size="small" @click="onSend" :loading="loading" type="primary">
             发送 Enter
-          </el-button>
-          <el-button v-if="canConfirmCreate" size="small" type="primary" @click="$emit('confirm-create')">
-            ✓ 确认创建
-          </el-button>
-          <el-button v-if="canConfirmStart" size="small" type="success" @click="$emit('confirm-start')">
-            🚀 确认开工
           </el-button>
         </div>
       </div>
